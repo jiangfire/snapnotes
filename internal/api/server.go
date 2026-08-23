@@ -3,11 +3,13 @@ package api
 import (
 	"bytes"
 	"crypto/ed25519"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"sync"
 	"time"
@@ -55,11 +57,12 @@ type streamState struct {
 	blocks     []blockRecord
 	peaks      [][]byte // running MMR peaks (ascending height) for bagged mmr_root
 	leafHashes [][]byte // ordered leaf hashes (one per block) for inclusion proofs
-		genesisHash []byte
-		owner       []byte
-		ownerEnc    []byte
-		members     map[string]*memberRecord
-		currentKeyEpoch uint64
+	chainwork  *big.Int // cumulative proof-of-work, real (Phase 5)
+	genesisHash []byte
+	owner       []byte
+	ownerEnc    []byte
+	members     map[string]*memberRecord
+	currentKeyEpoch uint64
 }
 
 type memberRecord struct {
@@ -74,17 +77,22 @@ type blockRecord struct {
 	txCBOR  []byte
 }
 
-// Ledger is the authoritative in-memory state for the MVP single-node server.
-// It stores the chain of blocks (genesis + one block per accepted transaction)
-// and the dedup sets used for validation. The immutable chain itself would live
-// in block files in a later phase.
+// Ledger is the authoritative state for the MVP single-node server. The in-memory
+// streamState is the hot cache used by all read paths; every accepted block is
+// persisted to a SQLite database (opened at dataDir/ledger.db) so the server can
+// rebuild identical chain + MMR state after a restart.
 type Ledger struct {
 	mu      sync.Mutex
 	streams map[string]*streamState
+	db      *sql.DB
+	anchors *anchorLog // append-only external root anchor log (Phase 5)
 }
 
-func NewLedger(configs []StreamConfig) (*Ledger, error) {
-	l := &Ledger{streams: make(map[string]*streamState)}
+// NewLedger opens (creating if necessary) the on-disk database at dataDir and
+// loads each configured stream from disk. A stream with no stored data is seeded
+// from its genesis block; a stream that already has data is rebuilt verbatim, so
+// the -genesis flag is only consulted when the data directory is empty.
+func NewLedger(configs []StreamConfig, dataDir string) (*Ledger, error) {
 	for _, cfg := range configs {
 		if len(cfg.StreamID) != 32 {
 			return nil, errors.New("stream_id must be 32 bytes")
@@ -96,50 +104,40 @@ func NewLedger(configs []StreamConfig) (*Ledger, error) {
 		if len(gp.InitialPowTarget) != 32 {
 			return nil, errors.New("genesis initial_pow_target must be 32 bytes")
 		}
-		auth := make(map[string]bool, len(cfg.AuthorizedKeys)+1)
-		for _, k := range cfg.AuthorizedKeys {
-			auth[hexKey(k)] = true
-		}
-		auth[hexKey(cfg.Genesis.Transaction.UnsignedBody.AuthorPublicKey)] = true
-		genesisCBOR, err := protocol.MarshalTransaction(
-			cfg.Genesis.Transaction.UnsignedBody,
-			cfg.Genesis.Transaction.TransactionID,
-			cfg.Genesis.Transaction.Signature,
-			cfg.Genesis.Transaction.PowEpoch,
-			cfg.Genesis.Transaction.PowNonce,
-		)
-		if err != nil {
+	}
+	db, err := openLedgerDB(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("open ledger db: %w", err)
+	}
+	anchors, err := openAnchorLog(dataDir)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open anchor log: %w", err)
+	}
+	l := &Ledger{streams: make(map[string]*streamState), db: db, anchors: anchors}
+	for _, cfg := range configs {
+		if err := l.loadOrSeedStream(cfg); err != nil {
+			db.Close()
+			anchors.Close()
 			return nil, err
-		}
-		genesisTxHash, err := protocol.TransactionHash(
-			cfg.Genesis.Transaction.UnsignedBody,
-			cfg.Genesis.Transaction.TransactionID,
-			cfg.Genesis.Transaction.Signature,
-			cfg.Genesis.Transaction.PowEpoch,
-			cfg.Genesis.Transaction.PowNonce,
-		)
-		if err != nil {
-			return nil, err
-		}
-		// Genesis carries exactly one leaf (its own transaction); seed the MMR peaks.
-		peaks := protocol.AddLeaf(nil, protocol.LeafHash(genesisTxHash), 0)
-		l.streams[hexKey(cfg.StreamID)] = &streamState{
-			target:      gp.InitialPowTarget,
-			authorized:  auth,
-			txIDs:       make(map[string]bool),
-			noteIDs:     make(map[string]bool),
-			count:       0,
-			blocks:      []blockRecord{{header: cfg.Genesis.Header, hash: cfg.Genesis.BlockHash, txCBOR: genesisCBOR}},
-			peaks:       peaks,
-			leafHashes:  [][]byte{protocol.LeafHash(genesisTxHash)},
-			genesisHash: cfg.Genesis.BlockHash,
-			owner:       append([]byte(nil), cfg.Genesis.Transaction.UnsignedBody.AuthorPublicKey...),
-			ownerEnc:    append([]byte(nil), gp.OwnerEncryptionPublicKey...),
-			members:     make(map[string]*memberRecord),
-			currentKeyEpoch: gp.InitialKeyEpoch,
 		}
 	}
 	return l, nil
+}
+
+// Close releases the ledger's database handle.
+func (l *Ledger) Close() error {
+	if l.db == nil {
+		return nil
+	}
+	_ = l.anchors.Close()
+	return l.db.Close()
+}
+
+// ReadAnchors returns the append-only external root anchor log (Phase 5). Each
+// record is a checkpoint of the active tip at the time a block was accepted.
+func (l *Ledger) ReadAnchors() ([]AnchorRecord, error) {
+	return l.anchors.ReadAnchors()
 }
 
 func hexKey(b []byte) string { return fmt.Sprintf("%x", b) }
@@ -201,6 +199,7 @@ func (l *Ledger) tryAccept(streamID []byte, tx notesync.Transaction) (acceptResu
 		return acceptRejected, 0, CodeStalePowEpoch
 	}
 
+	var d persistDelta
 	switch opType {
 	case "create":
 		var p createOpPayload
@@ -221,12 +220,16 @@ func (l *Ledger) tryAccept(streamID []byte, tx notesync.Transaction) (acceptResu
 		if len(p.DeviceID) == 0 || len(p.SigningPublicKey) != ed25519.PublicKeySize || len(p.EncryptionPublicKey) != 32 {
 			return acceptRejected, 0, CodeInvalidTransaction
 		}
-		st.members[hexKey(p.DeviceID)] = &memberRecord{
+		rec := &memberRecord{
 			signing: append([]byte(nil), p.SigningPublicKey...),
 			enc:     append([]byte(nil), p.EncryptionPublicKey...),
 			label:   p.Label,
 		}
+		st.members[hexKey(p.DeviceID)] = rec
 		st.authorized[hexKey(p.SigningPublicKey)] = true
+		d.newMember = rec
+		d.memberID = append([]byte(nil), p.DeviceID...)
+		d.addAuth = append(d.addAuth, hexKey(p.SigningPublicKey))
 	case "key_grant":
 		if !bytes.Equal(tx.AuthorPublicKey, st.owner) {
 			return acceptRejected, 0, CodeUnauthorizedKey
@@ -256,6 +259,9 @@ func (l *Ledger) tryAccept(streamID []byte, tx notesync.Transaction) (acceptResu
 		}
 		delete(st.authorized, hexKey(p.RevokedSigningPublicKey))
 		st.currentKeyEpoch = p.NewKeyEpoch
+		d.delAuth = append(d.delAuth, hexKey(p.RevokedSigningPublicKey))
+		d.epochChanged = true
+		d.newEpoch = p.NewKeyEpoch
 		// Fail-closed: every grant must name an already-enrolled member or the owner.
 		// A grant to an unknown device would hand it the epoch key without write
 		// authorisation, so the whole bundle is rejected rather than silently skipped.
@@ -266,6 +272,7 @@ func (l *Ledger) tryAccept(streamID []byte, tx notesync.Transaction) (acceptResu
 			}
 			if isMember {
 				st.authorized[hexKey(m.signing)] = true
+				d.addAuth = append(d.addAuth, hexKey(m.signing))
 			}
 		}
 	case "genesis":
@@ -297,16 +304,42 @@ func (l *Ledger) tryAccept(streamID []byte, tx notesync.Transaction) (acceptResu
 		MMRRoot:           mmrRoot,
 		Timestamp:         uint64(time.Now().UTC().UnixMilli()),
 	}
-	hash, err := protocol.BlockHash(header)
-	if err != nil {
-		return acceptRejected, 0, CodeInvalidTransaction
+	// Mine the block: search for a Nonce so the header hash meets the stream's
+	// current PoW target. The winning Nonce and target are embedded in the header
+	// so any verifier can re-check the work self-contained.
+	nonce, hash, ok := protocol.MineBlock(header, st.target, 0, nil)
+	if !ok {
+		return acceptRejected, 0, CodeInternal
 	}
-	st.blocks = append(st.blocks, blockRecord{header: header, hash: hash, txCBOR: txCBOR})
+	header.Nonce = nonce
+	header.PowTarget = st.target
+	rec := blockRecord{header: header, hash: hash, txCBOR: txCBOR}
+	st.blocks = append(st.blocks, rec)
 	st.txIDs[hexKey(txID)] = true
 	if opType == "create" {
 		st.noteIDs[hexKey(tx.NoteID)] = true
 	}
 	st.count++
+	// Real cumulative proof-of-work (Phase 5), not height+1.
+	st.chainwork.Add(st.chainwork, protocol.BlockWork(header.PowTarget))
+	d.newBlock = rec
+	d.leafHash = protocol.LeafHash(txHash)
+	d.txIDHex = hexKey(txID)
+	if opType == "create" {
+		d.noteIDHex = hexKey(tx.NoteID)
+	}
+	// Persist before acknowledging so a client only learns of a block once it is
+	// durable; the in-memory state above is rebuilt verbatim from disk on restart.
+	if err := l.persistDelta(streamID, d); err != nil {
+		return acceptRejected, 0, CodeInternal
+	}
+	// Phase 5 external root anchor: checkpoint the tip into the append-only log so
+	// an operator can mirror it to an immutable location for third-party verifiability.
+	_ = l.anchors.append(AnchorRecord{
+		Height:    height,
+		BlockHash: b64(hash),
+		MMRRoot:   b64(header.MMRRoot),
+	})
 	return acceptOK, height, ""
 }
 
@@ -404,21 +437,27 @@ func (l *Ledger) tip(streamID []byte) (tipResponse, bool) {
 		return tipResponse{}, false
 	}
 	last := st.blocks[len(st.blocks)-1]
+	work := new(big.Int)
+	if st.chainwork != nil {
+		work = st.chainwork
+	}
 	return tipResponse{
-		Height:     uint64(len(st.blocks) - 1),
-		BlockHash:  b64(last.hash),
-		Chainwork:  uint64(len(st.blocks)), // MVP: one unit per block; real chainwork in Phase 5
-		MMRRoot:    b64(last.header.MMRRoot),
-		LeafCount:  uint64(len(st.blocks)),
+		Height:       uint64(len(st.blocks) - 1),
+		BlockHash:    b64(last.hash),
+		Chainwork:    uint64(len(st.blocks)), // MVP display: block count
+		ChainworkHex: fmt.Sprintf("%x", work), // Phase 5: real cumulative PoW
+		MMRRoot:      b64(last.header.MMRRoot),
+		LeafCount:    uint64(len(st.blocks)),
 	}, true
 }
 
 type tipResponse struct {
-	Height    uint64 `json:"height"`
-	BlockHash string `json:"block_hash"`
-	Chainwork uint64 `json:"chainwork"`
-	MMRRoot   string `json:"mmr_root"`
-	LeafCount uint64 `json:"leaf_count"`
+	Height       uint64 `json:"height"`
+	BlockHash    string `json:"block_hash"`
+	Chainwork    uint64 `json:"chainwork"`
+	ChainworkHex string `json:"chainwork_hex"`
+	MMRRoot      string `json:"mmr_root"`
+	LeafCount    uint64 `json:"leaf_count"`
 }
 
 // readPage returns a bounded page of block headers or full blocks, honouring an
@@ -493,12 +532,28 @@ type Server struct {
 	hub    *wsHub
 }
 
-func NewServer(configs []StreamConfig) (*Server, error) {
-	ledger, err := NewLedger(configs)
+func NewServer(configs []StreamConfig, dataDir string) (*Server, error) {
+	return NewServerWithPeer(configs, dataDir, "")
+}
+
+// NewServerWithPeer builds the server and, when peerURL is non-empty, pulls the
+// peer's chain at startup and reorganises onto it if the peer carries strictly
+// greater cumulative proof-of-work (Phase 5 server-to-server sync).
+func NewServerWithPeer(configs []StreamConfig, dataDir, peerURL string) (*Server, error) {
+	ledger, err := NewLedger(configs, dataDir)
 	if err != nil {
 		return nil, err
 	}
+	if err := ledger.SyncFromPeer(peerURL); err != nil {
+		ledger.Close()
+		return nil, fmt.Errorf("peer sync: %w", err)
+	}
 	return &Server{ledger: ledger, hub: newWSHub()}, nil
+}
+
+// Close releases the server's ledger database handle.
+func (s *Server) Close() error {
+	return s.ledger.Close()
 }
 
 func (s *Server) Handler() http.Handler {
@@ -791,6 +846,8 @@ type blockWireHeader struct {
 	TransactionCount  uint64 `json:"transaction_count"`
 	MMRRoot           string `json:"mmr_root"`
 	Timestamp         uint64 `json:"timestamp"`
+	Nonce             uint64 `json:"nonce"`
+	PowTarget         string `json:"pow_target"`
 }
 
 type headerEntry struct {
@@ -820,6 +877,8 @@ func toWireHeader(h protocol.BlockHeader) blockWireHeader {
 		TransactionCount:  h.TransactionCount,
 		MMRRoot:           b64(h.MMRRoot),
 		Timestamp:         h.Timestamp,
+		Nonce:             h.Nonce,
+		PowTarget:         b64(h.PowTarget),
 	}
 }
 

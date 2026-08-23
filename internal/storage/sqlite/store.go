@@ -17,11 +17,6 @@ type Store struct {
 	db *sql.DB
 }
 
-type SearchResult struct {
-	Notes      []domain.Note
-	NextCursor string
-}
-
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -32,7 +27,8 @@ func Open(path string) (*Store, error) {
 		CREATE TABLE IF NOT EXISTS notes (
 			id TEXT PRIMARY KEY,
 			body TEXT NOT NULL,
-			created_at INTEGER NOT NULL
+			created_at INTEGER NOT NULL,
+			author_pubkey BLOB
 		);
 		CREATE TABLE IF NOT EXISTS local_reminders (
 			note_id TEXT PRIMARY KEY,
@@ -78,84 +74,78 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) SaveNote(note domain.Note) error {
-	tags := strings.Join(parser.Parse(note.Body).Tags, " ")
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	_, err = tx.Exec(
-		"INSERT INTO notes (id, body, created_at) VALUES (?, ?, ?)",
+	if err := s.insertNote(tx, note); err != nil {
+		return err
+	}
+	if err := s.insertReminder(tx, note.ID, note.Body); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// insertNote writes the notes row and its FTS entry. It assumes the caller
+// manages the surrounding transaction.
+func (s *Store) insertNote(tx *sql.Tx, note domain.Note) error {
+	tags := strings.Join(parser.Parse(note.Body).Tags, " ")
+	if _, err := tx.Exec(
+		"INSERT INTO notes (id, body, created_at, author_pubkey) VALUES (?, ?, ?, ?)",
 		note.ID,
 		note.Body,
 		note.CreatedAt.UTC().UnixMilli(),
-	)
-	if err != nil {
+		note.AuthorPublicKey,
+	); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(
+	if _, err := tx.Exec(
 		"INSERT INTO notes_fts(note_id, body, tags) VALUES (?, ?, ?)",
 		note.ID, note.Body, tags,
 	); err != nil {
 		return err
 	}
-	parsed := parser.Parse(note.Body)
-	if parsed.Reminder != nil {
-		schedule, err := reminder.NewSchedule(*parsed.Reminder, parsed.Repeat, time.UTC)
-		if err != nil {
-			return err
-		}
-		if _, err = tx.Exec(`INSERT INTO local_reminders
-			(note_id, next_fire_at, repeat_rule, timezone_name, timezone_offset_seconds, dismissed)
-			VALUES (?, ?, ?, ?, ?, 0)
-			ON CONFLICT(note_id) DO UPDATE SET next_fire_at=excluded.next_fire_at,
-			repeat_rule=excluded.repeat_rule, timezone_name=excluded.timezone_name,
-			timezone_offset_seconds=excluded.timezone_offset_seconds, dismissed=excluded.dismissed`,
-			note.ID, schedule.NextFireAt.UnixMilli(), schedule.Repeat, schedule.Timezone.String(), 0); err != nil {
-			return err
-		}
+	return nil
+}
+
+// insertReminder derives an optional reminder from the note body and upserts it.
+// A body without a reminder is a no-op.
+func (s *Store) insertReminder(tx *sql.Tx, noteID, body string) error {
+	parsed := parser.Parse(body)
+	if parsed.Reminder == nil {
+		return nil
 	}
-	return tx.Commit()
+	schedule, err := reminder.NewSchedule(*parsed.Reminder, parsed.Repeat, time.UTC)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO local_reminders
+		(note_id, next_fire_at, repeat_rule, timezone_name, timezone_offset_seconds, dismissed)
+		VALUES (?, ?, ?, ?, ?, 0)
+		ON CONFLICT(note_id) DO UPDATE SET next_fire_at=excluded.next_fire_at,
+		repeat_rule=excluded.repeat_rule, timezone_name=excluded.timezone_name,
+		timezone_offset_seconds=excluded.timezone_offset_seconds, dismissed=excluded.dismissed`,
+		noteID, schedule.NextFireAt.UnixMilli(), schedule.Repeat, schedule.Timezone.String(), 0)
+	return err
 }
 
 // SaveNoteWithOutbox persists a note and its outbound transaction in one local
 // transaction, so an offline create never loses its pending sync work.
 func (s *Store) SaveNoteWithOutbox(note domain.Note, item OutboxItem) error {
-	tags := strings.Join(parser.Parse(note.Body).Tags, " ")
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	if _, err = tx.Exec(
-		"INSERT INTO notes (id, body, created_at) VALUES (?, ?, ?)",
-		note.ID, note.Body, note.CreatedAt.UTC().UnixMilli(),
-	); err != nil {
+	if err := s.insertNote(tx, note); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(
-		"INSERT INTO notes_fts(note_id, body, tags) VALUES (?, ?, ?)",
-		note.ID, note.Body, tags,
-	); err != nil {
+	if err := s.insertReminder(tx, note.ID, note.Body); err != nil {
 		return err
-	}
-	parsed := parser.Parse(note.Body)
-	if parsed.Reminder != nil {
-		schedule, err := reminder.NewSchedule(*parsed.Reminder, parsed.Repeat, time.UTC)
-		if err != nil {
-			return err
-		}
-		if _, err = tx.Exec(`INSERT INTO local_reminders
-			(note_id, next_fire_at, repeat_rule, timezone_name, timezone_offset_seconds, dismissed)
-			VALUES (?, ?, ?, ?, ?, 0)
-			ON CONFLICT(note_id) DO UPDATE SET next_fire_at=excluded.next_fire_at,
-			repeat_rule=excluded.repeat_rule, timezone_name=excluded.timezone_name,
-			timezone_offset_seconds=excluded.timezone_offset_seconds, dismissed=excluded.dismissed`,
-			note.ID, schedule.NextFireAt.UnixMilli(), schedule.Repeat, schedule.Timezone.String(), 0); err != nil {
-			return err
-		}
 	}
 	if _, err = tx.Exec(`INSERT INTO outbox
 		(operation_id, stream_id, entity_id, transaction_id, operation_type, payload, created_at, sync_status)
@@ -165,6 +155,83 @@ func (s *Store) SaveNoteWithOutbox(note domain.Note, item OutboxItem) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// SaveSyncedNote records a note pulled from the chain during catch-up. It is
+// idempotent: a note already present (created locally then synced back, or
+// ingested on a previous sync) is left untouched, and its FTS entry is refreshed
+// rather than duplicated. This is the P2 glue that makes multi-device notes
+// visible in the local UI.
+func (s *Store) SaveSyncedNote(note domain.Note) error {
+	tags := strings.Join(parser.Parse(note.Body).Tags, " ")
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// INSERT OR IGNORE keeps the original row (and its author_pubkey) when the
+	// note already exists locally; only refresh the derived FTS row.
+	if _, err = tx.Exec(
+		"INSERT OR IGNORE INTO notes (id, body, created_at, author_pubkey) VALUES (?, ?, ?, ?)",
+		note.ID, note.Body, note.CreatedAt.UTC().UnixMilli(), note.AuthorPublicKey,
+	); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM notes_fts WHERE note_id = ?", note.ID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(
+		"INSERT INTO notes_fts(note_id, body, tags) VALUES (?, ?, ?)",
+		note.ID, note.Body, tags,
+	); err != nil {
+		return err
+	}
+	if err = s.insertReminder(tx, note.ID, note.Body); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// NoteSyncStatus reports whether a note has been uploaded (synced) or is still
+// waiting in the local outbox (pending). Notes ingested from remote peers are
+// always "synced" because they arrived on the verified chain.
+func (s *Store) NoteSyncStatus(id string) (string, error) {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM outbox WHERE entity_id = ? AND sync_status = ?`,
+		id, OutboxPending,
+	).Scan(&n); err != nil {
+		return "", err
+	}
+	if n > 0 {
+		return "pending", nil
+	}
+	return "synced", nil
+}
+
+// ChainTip returns the verified active chain position the client pinned during
+// sync, or (false, nil) if no sync has happened yet.
+func (s *Store) ChainTip() (domain.ChainTip, bool, error) {
+	var ct domain.ChainTip
+	var genesis, lastHash, mmr, work []byte
+	var height int64
+	err := s.db.QueryRow(
+		`SELECT genesis_block_hash, last_block_height, last_block_hash, last_mmr_root, last_chainwork
+		 FROM sync_state`,
+	).Scan(&genesis, &height, &lastHash, &mmr, &work)
+	if err == sql.ErrNoRows {
+		return domain.ChainTip{}, false, nil
+	}
+	if err != nil {
+		return domain.ChainTip{}, false, err
+	}
+	ct.GenesisBlockHash = append([]byte(nil), genesis...)
+	ct.LastBlockHeight = uint64(height)
+	ct.LastBlockHash = append([]byte(nil), lastHash...)
+	ct.LastMMRRoot = append([]byte(nil), mmr...)
+	ct.LastChainwork = append([]byte(nil), work...)
+	return ct, true, nil
 }
 
 func (s *Store) SaveReminder(noteID string, schedule reminder.Schedule) error {
@@ -214,9 +281,9 @@ func boolToInt(value bool) int {
 	return 0
 }
 
-func (s *Store) SearchNotes(query string, limit int, cursor string) (SearchResult, error) {
+func (s *Store) SearchNotes(query string, limit int, cursor string) (domain.SearchResult, error) {
 	if limit <= 0 {
-		return SearchResult{}, errors.New("search limit must be positive")
+		return domain.SearchResult{}, errors.New("search limit must be positive")
 	}
 	if limit > 100 {
 		limit = 100
@@ -226,20 +293,20 @@ func (s *Store) SearchNotes(query string, limit int, cursor string) (SearchResul
 	if strings.HasPrefix(matchQuery, "tag:") {
 		matchQuery = strings.TrimSpace(strings.TrimPrefix(matchQuery, "tag:"))
 		if matchQuery == "" {
-			return SearchResult{}, errors.New("tag query cannot be empty")
+			return domain.SearchResult{}, errors.New("tag query cannot be empty")
 		}
 		matchQuery = "tags : \"" + strings.ToLower(matchQuery) + "\""
 	}
 	if matchQuery == "" {
-		return SearchResult{}, errors.New("search query cannot be empty")
+		return domain.SearchResult{}, errors.New("search query cannot be empty")
 	}
 
 	lastCreatedAt, lastID, err := decodeCursor(cursor)
 	if err != nil {
-		return SearchResult{}, err
+		return domain.SearchResult{}, err
 	}
 	rows, err := s.db.Query(`
-		SELECT n.id, n.body, n.created_at
+		SELECT n.id, n.body, n.created_at, n.author_pubkey
 		FROM notes_fts f
 		JOIN notes n ON n.id = f.note_id
 		WHERE notes_fts MATCH ?
@@ -248,22 +315,22 @@ func (s *Store) SearchNotes(query string, limit int, cursor string) (SearchResul
 		LIMIT ?
 	`, matchQuery, lastCreatedAt, lastCreatedAt, lastID, limit+1)
 	if err != nil {
-		return SearchResult{}, err
+		return domain.SearchResult{}, err
 	}
 	defer rows.Close()
 
-	result := SearchResult{Notes: make([]domain.Note, 0, limit)}
+	result := domain.SearchResult{Notes: make([]domain.Note, 0, limit)}
 	for rows.Next() {
 		var note domain.Note
 		var createdAt int64
-		if err := rows.Scan(&note.ID, &note.Body, &createdAt); err != nil {
-			return SearchResult{}, err
+		if err := rows.Scan(&note.ID, &note.Body, &createdAt, &note.AuthorPublicKey); err != nil {
+			return domain.SearchResult{}, err
 		}
 		note.CreatedAt = time.UnixMilli(createdAt).UTC()
 		result.Notes = append(result.Notes, note)
 	}
 	if err := rows.Err(); err != nil {
-		return SearchResult{}, err
+		return domain.SearchResult{}, err
 	}
 	if len(result.Notes) > limit {
 		last := result.Notes[limit-1]
@@ -300,9 +367,9 @@ func (s *Store) GetNote(id string) (domain.Note, error) {
 	var note domain.Note
 	var createdAt int64
 	if err := s.db.QueryRow(
-		"SELECT id, body, created_at FROM notes WHERE id = ?",
+		"SELECT id, body, created_at, author_pubkey FROM notes WHERE id = ?",
 		id,
-	).Scan(&note.ID, &note.Body, &createdAt); err != nil {
+	).Scan(&note.ID, &note.Body, &createdAt, &note.AuthorPublicKey); err != nil {
 		return domain.Note{}, err
 	}
 
@@ -310,8 +377,20 @@ func (s *Store) GetNote(id string) (domain.Note, error) {
 	return note, nil
 }
 
+// PendingOutboxCount returns the number of not-yet-synced outbox items, used by
+// the TUI to show a "pending sync" indicator.
+func (s *Store) PendingOutboxCount() (int, error) {
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM outbox WHERE sync_status = ?`, OutboxPending,
+	).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 func (s *Store) ListNotes() ([]domain.Note, error) {
-	rows, err := s.db.Query("SELECT id, body, created_at FROM notes ORDER BY created_at DESC, id DESC")
+	rows, err := s.db.Query("SELECT id, body, created_at, author_pubkey FROM notes ORDER BY created_at DESC, id DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +400,7 @@ func (s *Store) ListNotes() ([]domain.Note, error) {
 	for rows.Next() {
 		var note domain.Note
 		var createdAt int64
-		if err := rows.Scan(&note.ID, &note.Body, &createdAt); err != nil {
+		if err := rows.Scan(&note.ID, &note.Body, &createdAt, &note.AuthorPublicKey); err != nil {
 			return nil, err
 		}
 		note.CreatedAt = time.UnixMilli(createdAt).UTC()

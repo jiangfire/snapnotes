@@ -149,10 +149,12 @@ func BuildGenesis(randomness io.Reader) (GenesisResult, error) {
 		MMRRoot:           mmrRoot,
 		Timestamp:         0,
 	}
-	blockHash, err := BlockHash(header)
-	if err != nil {
-		return GenesisResult{}, err
+	nonce, blockHash, ok := MineBlock(header, DefaultGenesisTarget(), 0, randomness)
+	if !ok {
+		return GenesisResult{}, errors.New("genesis mining failed to meet target")
 	}
+	header.Nonce = nonce
+	header.PowTarget = DefaultGenesisTarget()
 
 	return GenesisResult{
 		StreamID:                 streamID,

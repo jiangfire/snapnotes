@@ -28,6 +28,8 @@ type wireBlockHeader struct {
 	TransactionCount  uint64 `json:"transaction_count"`
 	MMRRoot           string `json:"mmr_root"`
 	Timestamp         uint64 `json:"timestamp"`
+	Nonce             uint64 `json:"nonce"`
+	PowTarget         string `json:"pow_target"`
 }
 
 // wireBlock is the JSON envelope for a /blocks entry: the full block is carried

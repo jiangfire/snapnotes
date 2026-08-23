@@ -49,12 +49,27 @@ func mustGenesis(t *testing.T) protocol.GenesisResult {
 func startServer(t *testing.T, gen protocol.GenesisResult, extraAuth ... ed25519.PublicKey) (*Server, *httptest.Server) {
 	t.Helper()
 	auth := append([]ed25519.PublicKey{gen.OwnerSigningPublicKey}, extraAuth...)
-	srv, err := NewServer([]StreamConfig{{StreamID: gen.StreamID, Genesis: gen.Block, AuthorizedKeys: auth}})
+	srv, err := NewServer([]StreamConfig{{StreamID: gen.StreamID, Genesis: gen.Block, AuthorizedKeys: auth}}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { _ = srv.Close() })
 	t.Cleanup(ts.Close)
+	return srv, ts
+}
+
+// startServerAt is like startServer but uses a caller-supplied data directory so a
+// test can Close the first server and reopen the same ledger to prove persistence.
+func startServerAt(t *testing.T, gen protocol.GenesisResult, dataDir string, extraAuth ... ed25519.PublicKey) (*Server, *httptest.Server) {
+	t.Helper()
+	auth := append([]ed25519.PublicKey{gen.OwnerSigningPublicKey}, extraAuth...)
+	srv, err := NewServer([]StreamConfig{{StreamID: gen.StreamID, Genesis: gen.Block, AuthorizedKeys: auth}}, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { _ = srv.Close(); ts.Close() })
 	return srv, ts
 }
 

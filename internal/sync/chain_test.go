@@ -51,7 +51,7 @@ func buildChain(t *testing.T, gen protocol.GenesisResult, n int, target []byte) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		blk, pk := makeBlock(t, parent, peaksList[i-1], uint64(i), tx, gen.StreamID)
+		blk, pk := makeBlock(t, parent, peaksList[i-1], uint64(i), tx, gen.StreamID, target)
 		blocks = append(blocks, blk)
 		peaksList = append(peaksList, pk)
 	}
@@ -59,7 +59,7 @@ func buildChain(t *testing.T, gen protocol.GenesisResult, n int, target []byte) 
 }
 
 func makeBlock(t *testing.T, parent protocol.Block, parentPeaks [][]byte, height uint64,
-	tx Transaction, streamID []byte) (protocol.Block, [][]byte) {
+	tx Transaction, streamID []byte, target []byte) (protocol.Block, [][]byte) {
 	t.Helper()
 	txHash, err := tx.Hash()
 	if err != nil {
@@ -75,11 +75,15 @@ func makeBlock(t *testing.T, parent protocol.Block, parentPeaks [][]byte, height
 		TransactionCount:  height + 1,
 		MMRRoot:           mmr,
 		Timestamp:         height * 1000,
+		PowTarget:         target,
 	}
-	bh, err := protocol.BlockHash(header)
-	if err != nil {
-		t.Fatal(err)
+	// Mine the block so it carries a valid nonce for its declared target. With a
+	// loose test target this is fast; it exercises the real Phase 5 PoW path.
+	nonce, bh, ok := protocol.MineBlock(header, target, 0, nil)
+	if !ok {
+		t.Fatalf("mine block height %d: no nonce met target", height)
 	}
+	header.Nonce = nonce
 	return protocol.Block{
 		Header:    header,
 		BlockHash: bh,
@@ -181,19 +185,15 @@ func TestChainManagerGreaterChainworkWinsRegardlessOfHeight(t *testing.T) {
 	}
 
 	// A fork that is SHORTER (fewer blocks) but mined at a HARDER difficulty so its
-	// cumulative chainwork exceeds chainA. The client credits each block's work from
-	// the PoW target schedule (here modelled as a harder target for the fork's
-	// heights); in production that target is the epoch-derived difficulty.
-	hardTarget := make([]byte, 32)
-	hardTarget[3] = 0x01                            // 2^224: strictly harder than 2^240
-	chainB, peaksB := buildChain(t, gen, 4, target) // heights 0..4, structurally valid
+	// cumulative chainwork exceeds chainA. Each block carries its own PoW target, so
+	// the harder target is credited directly from the header (not a schedule). The
+	// base target is 2^240 (byte[1]=0x01); we move that set bit down one position to
+	// byte[2]=0x80 (2^239), which halves the value => strictly harder (~2x work).
+	hardTarget := append([]byte(nil), target...)
+	hardTarget[1] = 0
+	hardTarget[2] = 0x80
+	chainB, peaksB := buildChain(t, gen, 4, hardTarget) // heights 0..4, each at harder target
 	m2 := newManager(t, gen, target)
-	m2.SetTargetSchedule(func(h uint64) []byte {
-		if h >= 1 && h <= 4 {
-			return hardTarget
-		}
-		return target
-	})
 	seedAndApply(t, m2, gen, chainB, peaksB)
 
 	tip2, _ := m2.store.ActiveTip()

@@ -31,28 +31,20 @@ type NoteStore interface {
 // deliberately performs no network I/O, so a stopped server never blocks a
 // local create (acceptance criterion for Task 3.2).
 type NoteService struct {
-	Store      NoteStore
-	Keys       ClientKeys
-	Random     io.Reader
-	NextNoteID func() string
-	NextOpID   func() string
+	Store    NoteStore
+	Keys     ClientKeys
+	Random   io.Reader
+	NextOpID func() string
 }
 
 // Submit saves a note locally and enqueues its outbound transaction in one local
-// transaction. It returns the local note id; the actual upload happens later via
+// transaction. It returns the local note id (aligned with the chain note_id so a
+// loopback re-ingest reuses the same row); the actual upload happens later via
 // SyncClient.
 func (s *NoteService) Submit(body string, createdAt time.Time) (string, error) {
 	random := s.Random
 	if random == nil {
 		random = rand.Reader
-	}
-	nextID := s.NextNoteID
-	if nextID == nil {
-		nextID = defaultLocalNoteID
-	}
-	note, err := domain.CreateNote(body, createdAt, nextID)
-	if err != nil {
-		return "", err
 	}
 
 	tx, err := BuildCreate(CreateParams{
@@ -67,6 +59,16 @@ func (s *NoteService) Submit(body string, createdAt time.Time) (string, error) {
 		PowTarget:       s.Keys.PowTarget,
 		PowEpoch:        s.Keys.PowEpoch,
 	})
+	if err != nil {
+		return "", err
+	}
+
+	// Align the local note id with the chain's note_id so that a device's own
+	// create reappearing via chain loopback reuses the same row (SaveSyncedNote
+	// is INSERT OR IGNORE) instead of duplicating it. The outbox EntityID already
+	// uses hex(tx.NoteID); keeping them equal makes the two paths converge.
+	localID := hex.EncodeToString(tx.NoteID)
+	note, err := domain.CreateNote(body, createdAt, func() string { return localID })
 	if err != nil {
 		return "", err
 	}

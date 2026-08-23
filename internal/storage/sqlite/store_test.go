@@ -36,7 +36,7 @@ func TestStorePersistsNoteAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetNote returned error: %v", err)
 	}
-	if got != want {
+	if got.ID != want.ID || got.Body != want.Body || !got.CreatedAt.Equal(want.CreatedAt) {
 		t.Fatalf("reloaded note = %+v, want %+v", got, want)
 	}
 }
@@ -61,7 +61,7 @@ func TestStoreListsNotesNewestFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListNotes returned error: %v", err)
 	}
-	if len(notes) != 2 || notes[0] != newer || notes[1] != older {
+	if len(notes) != 2 || notes[0].ID != newer.ID || notes[1].ID != older.ID {
 		t.Fatalf("listed notes = %+v, want newer then older", notes)
 	}
 }

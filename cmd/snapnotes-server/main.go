@@ -19,6 +19,8 @@ func main() {
 	authKeys := flag.String("authorized-keys", "", "comma-separated hex Ed25519 public keys allowed to write")
 	genKey := flag.Bool("gen-key", false, "generate a signing key pair, print the public key, and exit")
 	genesisB64 := flag.String("genesis", "", "base64 of a previously generated genesis block; reuse across restarts to keep the same trust anchor")
+	dataDir := flag.String("data-dir", ".snapnotes-server", "directory for the on-disk ledger (blocks, MMR leaves, members); created if missing")
+	peerURL := flag.String("peer", "", "URL of a peer snapnotes-server to sync the chain from at startup (headers-first pull + chain selection)")
 	flag.Parse()
 
 	if *genKey {
@@ -51,13 +53,18 @@ func main() {
 		log.Println("warning: no authorized keys configured; all writes will be rejected")
 	}
 
-	server, err := api.NewServer([]api.StreamConfig{{
+	server, err := api.NewServerWithPeer([]api.StreamConfig{{
 		StreamID:       gen.StreamID,
 		Genesis:        gen.Block,
 		AuthorizedKeys: keys,
-	}})
+	}}, *dataDir, *peerURL)
 	if err != nil {
 		log.Fatal(err)
+	}
+	defer server.Close()
+
+	if *peerURL != "" {
+		log.Printf("peer_sync_url=%s", *peerURL)
 	}
 
 	log.Printf("stream_id=%s", base64.RawURLEncoding.EncodeToString(gen.StreamID))
@@ -71,6 +78,7 @@ func main() {
 		log.Printf("genesis_block=%s", base64.StdEncoding.EncodeToString(blockCBOR))
 		log.Println("pass the genesis_block value via -genesis on restart to keep the same trust anchor")
 	}
+	log.Printf("ledger_data_dir=%s", *dataDir)
 	log.Printf("snapnotes-server listening on %s", *listen)
 	if err := http.ListenAndServe(*listen, server.Handler()); err != nil {
 		log.Fatal(err)

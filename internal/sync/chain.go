@@ -24,6 +24,7 @@ const (
 var (
 	ErrMalformedHeader = errors.New("malformed peer header: failed verification")
 	ErrMissingParent   = errors.New("parent header not yet known; fetch in height order")
+	ErrInsufficientWork = errors.New("block proof-of-work does not meet its declared target")
 )
 
 // VerifiedHeader is a block header the client has verified, together with the
@@ -224,6 +225,12 @@ func (m *ChainManager) ApplyHeader(header protocol.BlockHeader, blockHash []byte
 		return ErrMalformedHeader
 	}
 
+	// 1b. Proof-of-work: the header's own block hash must meet its declared target.
+	// Each block carries its PowTarget, so verification needs no out-of-band schedule.
+	if !protocol.BlockSatisfiesTarget(header) {
+		return ErrInsufficientWork
+	}
+
 	// 2. Genesis / linkage validation.
 	if header.Height == 0 {
 		if !isZero(header.PreviousBlockHash) {
@@ -242,7 +249,8 @@ func (m *ChainManager) ApplyHeader(header protocol.BlockHeader, blockHash []byte
 		}
 	}
 
-	// 3. Cumulative chainwork along this header's own parent chain.
+	// 3. Cumulative chainwork along this header's own parent chain, using the
+	// block's self-declared PoW target (not the schedule, which the header proves).
 	var parentWork *big.Int
 	var parentPeaks [][]byte
 	if header.Height == 0 {
@@ -252,7 +260,7 @@ func (m *ChainManager) ApplyHeader(header protocol.BlockHeader, blockHash []byte
 		parentWork = parent.Chainwork
 		parentPeaks = parent.Peaks
 	}
-	blockWork := protocol.BlockWork(m.targetAt(header.Height))
+	blockWork := protocol.BlockWork(header.PowTarget)
 	chainwork := new(big.Int).Add(parentWork, blockWork)
 
 	// 4. Record the header (peaks here is the snapshot to extend at finalize).

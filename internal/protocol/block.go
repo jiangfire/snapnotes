@@ -2,13 +2,22 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"io"
+	"math/big"
 )
 
 // BlockHeader is the canonical CBOR header shared by every chain block. The
 // mmr_root field carries the peak-bagging MMR root defined in the Phase 5 amendment
 // (see mmr.go): a bagged hash of all mountain summits over the stream's leaf hashes.
+//
+// Nonce and PowTarget make the header mineable: the block hash is taken over the
+// canonical CBOR of this header (including Nonce and PowTarget), so a miner can
+// search for a Nonce whose resulting hash is numerically <= PowTarget. PowTarget is
+// embedded in the header so each block is self-verifying — a verifier needs no
+// out-of-band schedule to check the work.
 type BlockHeader struct {
 	ProtocolVersion   uint64 `cbor:"protocol_version"`
 	Height            uint64 `cbor:"height"`
@@ -16,6 +25,73 @@ type BlockHeader struct {
 	TransactionCount  uint64 `cbor:"transaction_count"`
 	MMRRoot           []byte `cbor:"mmr_root"`
 	Timestamp         uint64 `cbor:"timestamp"`
+	Nonce             uint64 `cbor:"nonce"`
+	PowTarget         []byte `cbor:"pow_target"`
+}
+
+// MaxPoWTrials bounds a single MineBlock call so a caller can stay responsive; a
+// real miner loops MineBlock with fresh randomness until ok is true.
+const MaxPoWTrials uint64 = 1 << 20
+
+// hashBigEndianAsBigInt interprets a 32-byte hash as a big-endian unsigned integer.
+func hashBigEndianAsBigInt(h []byte) *big.Int {
+	return new(big.Int).SetBytes(h)
+}
+
+// BlockSatisfiesTarget reports whether the header's own block hash meets its
+// declared PoW target (hash <= target, big-endian unsigned comparison). An empty
+// PowTarget means "no work required" (used only for test/fixture headers).
+func BlockSatisfiesTarget(header BlockHeader) bool {
+	if len(header.PowTarget) == 0 {
+		return true
+	}
+	hash, err := BlockHash(header)
+	if err != nil {
+		return false
+	}
+	return hashBigEndianAsBigInt(hash).Cmp(hashBigEndianAsBigInt(header.PowTarget)) <= 0
+}
+
+// MineBlock searches for a Nonce such that BlockHash(header with that Nonce and the
+// given PowTarget) is numerically <= target. It sets header.PowTarget = target,
+// then iterates Nonce from a random start for up to maxTrials attempts. It returns
+// the winning nonce and the resulting block hash. ok is false if no nonce satisfied
+// the target within maxTrials (caller should retry with more trials / fresh start).
+func MineBlock(header BlockHeader, target []byte, maxTrials uint64, randomness io.Reader) (nonce uint64, hash []byte, ok bool) {
+	if randomness == nil {
+		randomness = rand.Reader
+	}
+	if maxTrials == 0 {
+		maxTrials = MaxPoWTrials
+	}
+	hdr := header
+	hdr.PowTarget = target
+	// Random starting offset so concurrent/retry miners don't scan the same range.
+	var seed [8]byte
+	if _, err := io.ReadFull(randomness, seed[:]); err == nil {
+		nonce = hashBigEndianAsBigInt(seed[:]).Uint64()
+	}
+	limit := nonce + maxTrials
+	for {
+		hdr.Nonce = nonce
+		h, err := BlockHash(hdr)
+		if err == nil && BlockSatisfiesTarget(hdr) {
+			return nonce, h, true
+		}
+		nonce++
+		if nonce == limit {
+			// If we wrapped exactly onto the limit, stop; otherwise the for-loop
+			// condition handles termination.
+			if limit == 0 {
+				return 0, nil, false
+			}
+		}
+		if nonce == 0 {
+			// wrapped around uint64; stop to avoid infinite loop
+			return 0, nil, false
+		}
+		_ = h
+	}
 }
 
 // Block couples a header with its canonical transaction CBOR, so a client can
@@ -46,6 +122,13 @@ func BlockHash(h BlockHeader) ([]byte, error) {
 	}
 	sum := sha256.Sum256(append([]byte("snapnotes/block/v1"), data...))
 	return sum[:], nil
+}
+
+// MarshalBlockHeader serialises a BlockHeader to strict canonical CBOR, matching
+// the encoding DecodeBlockHeader expects. The ledger uses it to persist block
+// headers to disk so they can be rebuilt verbatim on restart.
+func MarshalBlockHeader(h BlockHeader) ([]byte, error) {
+	return canonicalEncoder.Marshal(h)
 }
 
 // DecodeBlockHeader parses a strict canonical CBOR BlockHeader.

@@ -2,10 +2,17 @@ module github.com/jiangfire/snapnotes
 
 go 1.26.6
 
-require modernc.org/sqlite v1.57.0
+require (
+	charm.land/bubbletea/v2 v2.0.8
+	filippo.io/age v1.3.1
+	github.com/fxamacker/cbor/v2 v2.9.3
+	github.com/gorilla/websocket v1.5.3
+	golang.org/x/crypto v0.48.0
+	modernc.org/sqlite v1.57.0
+)
 
 require (
-	charm.land/bubbletea/v2 v2.0.8 // indirect
+	filippo.io/hpke v0.4.0 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260703014108-f5a850f9c2b7 // indirect
 	github.com/charmbracelet/x/ansi v0.11.7 // indirect
@@ -15,9 +22,7 @@ require (
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/fxamacker/cbor/v2 v2.9.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mattn/go-runewidth v0.0.23 // indirect
@@ -27,7 +32,6 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	modernc.org/libc v1.74.4 // indirect

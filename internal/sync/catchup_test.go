@@ -33,11 +33,12 @@ func startAPI(t *testing.T, gen protocol.GenesisResult) (*api.Server, *httptest.
 		StreamID: gen.StreamID,
 		Genesis:  gen.Block,
 		AuthorizedKeys: []ed25519.PublicKey{gen.OwnerSigningPublicKey},
-	}})
+	}}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { _ = srv.Close() })
 	t.Cleanup(ts.Close)
 	return srv, ts
 }

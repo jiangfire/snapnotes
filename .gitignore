@@ -33,3 +33,7 @@ go.work.sum
 
 # Local WorkBuddy project memory (not source)
 .workbuddy/
+
+# Local runtime data (client config with key material, server ledger)
+.snapnotes/
+.snapnotes-server/

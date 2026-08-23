@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/jiangfire/snapnotes/internal/domain"
 	"github.com/jiangfire/snapnotes/internal/protocol"
 	"github.com/jiangfire/snapnotes/internal/storage/sqlite"
 )
@@ -22,13 +23,15 @@ const (
 )
 
 // SyncRepository is the local persistence surface the SyncClient needs: it must
-// serve the pending outbox and remember the device's verified chain position.
+// serve the pending outbox, remember the device's verified chain position, and
+// persist notes pulled from the chain so they become visible in the local UI.
 type SyncRepository interface {
 	ListPendingOutbox() ([]sqlite.OutboxItem, error)
 	MarkOutboxSynced(operationID string) error
 	MarkOutboxFailed(operationID string) error
 	GetSyncState(streamID []byte) (sqlite.SyncState, bool, error)
 	SaveSyncState(state sqlite.SyncState) error
+	SaveSyncedNote(note domain.Note) error
 }
 
 // TrustAnchor is the out-of-band bootstrap the client uses to verify a chain.
@@ -47,6 +50,13 @@ type SyncClient struct {
 	HTTP     *http.Client
 	Anchor   TrustAnchor
 	DeviceID string
+
+	// StreamKey and KeyEpoch are the epoch key material needed to decrypt
+	// pulled notes. For the single-epoch MVP the owner's epoch-0 Stream Key is
+	// supplied directly; a multi-epoch future would swap this for a key store
+	// keyed by KeyEpoch.
+	StreamKey []byte
+	KeyEpoch  uint64
 }
 
 // Sync submits pending outbox items and catches up the local chain position.
@@ -211,4 +221,11 @@ func errorCode(resp *http.Response) string {
 		return e.Error.Code
 	}
 	return ""
+}
+
+// VerifyLeaf verifies the MMR inclusion proof for the leaf (transaction) at the
+// given 0-indexed position against the client's locally verified chain. It is a
+// thin wrapper over VerifyLeafInclusion for callers that do not manage a context.
+func (c *SyncClient) VerifyLeaf(index uint64) (bool, error) {
+	return c.VerifyLeafInclusion(context.Background(), index)
 }
